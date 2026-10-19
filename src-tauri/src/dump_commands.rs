@@ -7,6 +7,7 @@ use crate::drivers::driver_trait::DatabaseDriver;
 use crate::dump_utils::DumpDialect;
 use crate::models::{ConnectionParams, Pagination, TableColumn};
 use crate::pool_manager::{get_mysql_pool, get_postgres_pool, get_sqlite_pool};
+use async_trait::async_trait;
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -27,6 +28,73 @@ pub struct DumpOptions {
 #[derive(Default)]
 pub struct DumpCancellationState {
     pub handles: Arc<Mutex<AbortHandleMap>>,
+}
+
+/// Where `write_dump` sends what it produces: a `.sql` file for Export, or
+/// the target connection for Copy Database (see `copy_database`).
+#[async_trait]
+pub(crate) trait DumpSink: Send {
+    /// A `-- comment` line. Sinks that execute statements ignore it.
+    async fn comment(&mut self, text: &str) -> Result<(), String>;
+    /// One complete SQL statement.
+    async fn statement(&mut self, sql: &str) -> Result<(), String>;
+    /// A blank line between sections. Sinks that execute statements ignore it.
+    async fn blank_line(&mut self) -> Result<(), String>;
+    /// The driver could not produce the DDL of `table_ref`. A dump file
+    /// notes it and leaves that table alone; a copy cannot go on without it.
+    async fn missing_ddl(&mut self, table_ref: &str, error: &str) -> Result<(), String>;
+}
+
+/// Writes a dump to a `.sql` file.
+pub(crate) struct FileDumpSink {
+    writer: BufWriter<File>,
+}
+
+impl FileDumpSink {
+    fn create(path: &str) -> Result<Self, String> {
+        let file = File::create(path).map_err(|e| e.to_string())?;
+        Ok(Self {
+            writer: BufWriter::new(file),
+        })
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        self.writer.flush().map_err(|e| e.to_string())
+    }
+}
+
+#[async_trait]
+impl DumpSink for FileDumpSink {
+    async fn comment(&mut self, text: &str) -> Result<(), String> {
+        writeln!(self.writer, "-- {}", text).map_err(|e| e.to_string())
+    }
+
+    async fn statement(&mut self, sql: &str) -> Result<(), String> {
+        writeln!(self.writer, "{}", sql).map_err(|e| e.to_string())
+    }
+
+    async fn blank_line(&mut self) -> Result<(), String> {
+        writeln!(self.writer).map_err(|e| e.to_string())
+    }
+
+    async fn missing_ddl(&mut self, table_ref: &str, error: &str) -> Result<(), String> {
+        writeln!(
+            self.writer,
+            "-- WARNING: could not generate DDL for {}: {} (table left unchanged)\n",
+            table_ref, error
+        )
+        .map_err(|e| e.to_string())
+    }
+}
+
+/// What `write_dump` produces for each table.
+pub(crate) struct DumpPlan<'a> {
+    pub tables: &'a [String],
+    pub structure: bool,
+    pub data: bool,
+    /// Precede each `CREATE TABLE` with `DROP TABLE IF EXISTS`. Export always
+    /// does; Copy Database only when the user asks to replace tables.
+    pub drop_existing: bool,
 }
 
 /// Slot key for the cancellation registry. Imports share the dump state
@@ -79,14 +147,15 @@ pub async fn dump_database<R: Runtime>(
 
     // Spawn the dump process
     let task = tokio::spawn(async move {
-        let file = File::create(&file_path).map_err(|e| e.to_string())?;
-        let mut writer = BufWriter::new(file);
+        let mut sink = FileDumpSink::create(&file_path)?;
 
         // Write header
-        writeln!(writer, "-- Tabularis Dump").map_err(|e| e.to_string())?;
-        writeln!(writer, "-- Database: {}", params.database).map_err(|e| e.to_string())?;
-        writeln!(writer, "-- Date: {}\n", chrono::Local::now().to_rfc3339())
-            .map_err(|e| e.to_string())?;
+        sink.comment("Tabularis Dump").await?;
+        sink.comment(&format!("Database: {}", params.database))
+            .await?;
+        sink.comment(&format!("Date: {}", chrono::Local::now().to_rfc3339()))
+            .await?;
+        sink.blank_line().await?;
 
         // Get tables
         let drv = crate::drivers::registry::get_connection_driver(&params).await?;
@@ -109,77 +178,24 @@ pub async fn dump_database<R: Runtime>(
             all_tables.into_iter().map(|t| t.name).collect()
         };
 
-        for table in tables_to_process {
-            if options.structure {
-                writeln!(
-                    writer,
-                    "-- Structure for table {}",
-                    dialect.table_ref(scoped_schema, &table)
-                )
-                .map_err(|e| e.to_string())?;
-                // A plugin that doesn't implement get_table_ddl must not
-                // abort the whole dump over one table's missing structure —
-                // the data step below still runs for it, and every other
-                // table's structure/data is unaffected. Composing an
-                // approximate CREATE TABLE from generic column/FK/index
-                // metadata was considered and rejected: a dump file is meant
-                // to be restored, and a plausible-looking but subtly wrong
-                // DDL statement (missed default, generated column, check
-                // constraint) is worse than a visible, honest gap.
-                //
-                // The DROP TABLE IF EXISTS is written only when DDL is
-                // available, not unconditionally before the DDL fetch: writing
-                // the DROP first then failing to emit a CREATE TABLE produces a
-                // dump file whose import deletes the restore target with no way
-                // to recreate it (the builtin drivers wrap import in a
-                // transaction that rolls back, but plugin drivers execute each
-                // statement independently — the DROP commits and the table is
-                // gone). Skipping both when DDL fails leaves the existing table
-                // intact.
-                match drv.get_table_ddl(&params, &table, scoped_schema).await {
-                    Ok(ddl) => {
-                        writeln!(
-                            writer,
-                            "{}",
-                            dialect.drop_table_if_exists(scoped_schema, &table)
-                        )
-                        .map_err(|e| e.to_string())?;
-                        writeln!(writer, "{}\n", ddl).map_err(|e| e.to_string())?;
-                    }
-                    Err(e) => {
-                        writeln!(
-                            writer,
-                            "-- WARNING: could not generate DDL for {}: {} (table left unchanged)\n",
-                            dialect.table_ref(scoped_schema, &table),
-                            e
-                        )
-                        .map_err(|e| e.to_string())?;
-                    }
-                }
-            }
+        write_dump(
+            &mut sink,
+            &drv,
+            &params,
+            &driver,
+            &dialect,
+            scoped_schema,
+            &DumpPlan {
+                tables: &tables_to_process,
+                structure: options.structure,
+                data: options.data,
+                drop_existing: true,
+            },
+            &|_, _| {},
+        )
+        .await?;
 
-            if options.data {
-                writeln!(
-                    writer,
-                    "-- Data for table {}",
-                    dialect.table_ref(scoped_schema, &table)
-                )
-                .map_err(|e| e.to_string())?;
-                export_table_data(
-                    &mut writer,
-                    &drv,
-                    &params,
-                    &driver,
-                    &dialect,
-                    &table,
-                    scoped_schema,
-                )
-                .await?;
-                writeln!(writer, "\n").map_err(|e| e.to_string())?;
-            }
-        }
-
-        writer.flush().map_err(|e| e.to_string())?;
+        sink.flush()?;
         Ok::<(), String>(())
     });
 
@@ -196,8 +212,79 @@ pub async fn dump_database<R: Runtime>(
     }
 }
 
+/// Writes the structure and/or data of `plan.tables` to `sink`, table by
+/// table. `on_table` is called with each table's index and name before it is
+/// written.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn write_dump(
+    sink: &mut dyn DumpSink,
+    drv: &Arc<dyn DatabaseDriver>,
+    params: &ConnectionParams,
+    driver: &str,
+    dialect: &DumpDialect,
+    scoped_schema: Option<&str>,
+    plan: &DumpPlan<'_>,
+    on_table: &(dyn Fn(usize, &str) + Send + Sync),
+) -> Result<(), String> {
+    for (index, table) in plan.tables.iter().enumerate() {
+        on_table(index, table);
+        if plan.structure {
+            sink.comment(&format!(
+                "Structure for table {}",
+                dialect.table_ref(scoped_schema, table)
+            ))
+            .await?;
+            // A plugin that doesn't implement get_table_ddl must not
+            // abort the whole dump over one table's missing structure —
+            // the data step below still runs for it, and every other
+            // table's structure/data is unaffected. Composing an
+            // approximate CREATE TABLE from generic column/FK/index
+            // metadata was considered and rejected: a dump file is meant
+            // to be restored, and a plausible-looking but subtly wrong
+            // DDL statement (missed default, generated column, check
+            // constraint) is worse than a visible, honest gap.
+            //
+            // The DROP TABLE IF EXISTS is written only when DDL is
+            // available, not unconditionally before the DDL fetch: writing
+            // the DROP first then failing to emit a CREATE TABLE produces a
+            // dump file whose import deletes the restore target with no way
+            // to recreate it (the builtin drivers wrap import in a
+            // transaction that rolls back, but plugin drivers execute each
+            // statement independently — the DROP commits and the table is
+            // gone). Skipping both when DDL fails leaves the existing table
+            // intact.
+            match drv.get_table_ddl(params, table, scoped_schema).await {
+                Ok(ddl) => {
+                    if plan.drop_existing {
+                        sink.statement(&dialect.drop_table_if_exists(scoped_schema, table))
+                            .await?;
+                    }
+                    sink.statement(&ddl).await?;
+                    sink.blank_line().await?;
+                }
+                Err(e) => {
+                    sink.missing_ddl(&dialect.table_ref(scoped_schema, table), &e)
+                        .await?;
+                }
+            }
+        }
+
+        if plan.data {
+            sink.comment(&format!(
+                "Data for table {}",
+                dialect.table_ref(scoped_schema, table)
+            ))
+            .await?;
+            export_table_data(sink, drv, params, driver, dialect, table, scoped_schema).await?;
+            sink.blank_line().await?;
+            sink.blank_line().await?;
+        }
+    }
+    Ok(())
+}
+
 async fn export_table_data(
-    writer: &mut BufWriter<File>,
+    sink: &mut dyn DumpSink,
     drv: &Arc<dyn DatabaseDriver>,
     params: &ConnectionParams,
     driver: &str,
@@ -252,22 +339,18 @@ async fn export_table_data(
                 batch.push(format!("({})", values.join(", ")));
 
                 if batch.len() >= 100 {
-                    writeln!(
-                        writer,
-                        "{}",
-                        dialect.insert_into_statement(schema, table, &batch.join(", "))
-                    )
-                    .map_err(|e| e.to_string())?;
+                    sink.statement(&dialect.insert_into_statement(
+                        schema,
+                        table,
+                        &batch.join(", "),
+                    ))
+                    .await?;
                     batch.clear();
                 }
             }
             if !batch.is_empty() {
-                writeln!(
-                    writer,
-                    "{}",
-                    dialect.insert_into_statement(schema, table, &batch.join(", "))
-                )
-                .map_err(|e| e.to_string())?;
+                sink.statement(&dialect.insert_into_statement(schema, table, &batch.join(", ")))
+                    .await?;
             }
         }
         "postgres" => {
@@ -310,22 +393,18 @@ async fn export_table_data(
                 batch.push(format!("({})", values.join(", ")));
 
                 if batch.len() >= 100 {
-                    writeln!(
-                        writer,
-                        "{}",
-                        dialect.insert_into_statement(schema, table, &batch.join(", "))
-                    )
-                    .map_err(|e| e.to_string())?;
+                    sink.statement(&dialect.insert_into_statement(
+                        schema,
+                        table,
+                        &batch.join(", "),
+                    ))
+                    .await?;
                     batch.clear();
                 }
             }
             if !batch.is_empty() {
-                writeln!(
-                    writer,
-                    "{}",
-                    dialect.insert_into_statement(schema, table, &batch.join(", "))
-                )
-                .map_err(|e| e.to_string())?;
+                sink.statement(&dialect.insert_into_statement(schema, table, &batch.join(", ")))
+                    .await?;
             }
         }
         "sqlite" => {
@@ -360,22 +439,18 @@ async fn export_table_data(
                 batch.push(format!("({})", values.join(", ")));
 
                 if batch.len() >= 100 {
-                    writeln!(
-                        writer,
-                        "{}",
-                        dialect.insert_into_statement(schema, table, &batch.join(", "))
-                    )
-                    .map_err(|e| e.to_string())?;
+                    sink.statement(&dialect.insert_into_statement(
+                        schema,
+                        table,
+                        &batch.join(", "),
+                    ))
+                    .await?;
                     batch.clear();
                 }
             }
             if !batch.is_empty() {
-                writeln!(
-                    writer,
-                    "{}",
-                    dialect.insert_into_statement(schema, table, &batch.join(", "))
-                )
-                .map_err(|e| e.to_string())?;
+                sink.statement(&dialect.insert_into_statement(schema, table, &batch.join(", ")))
+                    .await?;
             }
         }
         // Any plugin-backed driver: no local pool to stream from (the plugin
@@ -408,12 +483,12 @@ async fn export_table_data(
                     ));
 
                     if batch.len() >= 100 {
-                        writeln!(
-                            writer,
-                            "{}",
-                            dialect.insert_into_statement(schema, table, &batch.join(", "))
-                        )
-                        .map_err(|e| e.to_string())?;
+                        sink.statement(&dialect.insert_into_statement(
+                            schema,
+                            table,
+                            &batch.join(", "),
+                        ))
+                        .await?;
                         batch.clear();
                     }
                 }
@@ -425,12 +500,8 @@ async fn export_table_data(
                 page += 1;
             }
             if !batch.is_empty() {
-                writeln!(
-                    writer,
-                    "{}",
-                    dialect.insert_into_statement(schema, table, &batch.join(", "))
-                )
-                .map_err(|e| e.to_string())?;
+                sink.statement(&dialect.insert_into_statement(schema, table, &batch.join(", ")))
+                    .await?;
             }
         }
     }
@@ -521,7 +592,7 @@ impl<R: BufRead> SqlStatementStream<R> {
         }
     }
 
-    fn next_statement(&mut self) -> Result<Option<String>, String> {
+    fn read_next_statement(&mut self) -> Result<Option<String>, String> {
         loop {
             self.line_buffer.clear();
             let bytes_read = self
@@ -561,15 +632,30 @@ impl<R: BufRead> SqlStatementStream<R> {
     }
 }
 
+/// Where `execute_statements` reads statements from: a dump file for Import,
+/// or the source connection for Copy Database (see `copy_database`).
+#[async_trait]
+pub(crate) trait StatementSource: Send {
+    /// The next statement, or `None` when there are no more.
+    async fn next_statement(&mut self) -> Result<Option<String>, String>;
+}
+
+#[async_trait]
+impl<R: BufRead + Send> StatementSource for SqlStatementStream<R> {
+    async fn next_statement(&mut self) -> Result<Option<String>, String> {
+        self.read_next_statement()
+    }
+}
+
 // Helper macro for streaming execution with progress
 macro_rules! execute_statements_streaming {
-    ($executor_macro:ident, $stream:expr, $app:expr) => {{
+    ($executor_macro:ident, $stream:expr, $on_progress:expr) => {{
         // Larger batch for better performance - execute and emit progress every 500 statements
         const PROGRESS_EMIT_INTERVAL: usize = 500;
         let mut executed = 0;
         let mut since_last_progress = 0;
 
-        while let Some(stmt) = $stream.next_statement()? {
+        while let Some(stmt) = $stream.next_statement().await? {
             // Execute statement immediately without batching in memory
             $executor_macro!(&stmt).await.map_err(|e| {
                 format!(
@@ -585,29 +671,23 @@ macro_rules! execute_statements_streaming {
 
             // Emit progress only every PROGRESS_EMIT_INTERVAL statements to reduce overhead
             if since_last_progress >= PROGRESS_EMIT_INTERVAL {
-                let _ = $app.emit(
-                    "import_progress",
-                    ImportProgress {
-                        statements_executed: executed,
-                        total_statements: 0, // 0 indicates unknown total
-                        percentage: 0.0,
-                        current_operation: format!("Imported {} statements", executed),
-                    },
-                );
+                $on_progress(ImportProgress {
+                    statements_executed: executed,
+                    total_statements: 0, // 0 indicates unknown total
+                    percentage: 0.0,
+                    current_operation: format!("Imported {} statements", executed),
+                });
                 since_last_progress = 0;
             }
         }
 
         // Final progress update
-        let _ = $app.emit(
-            "import_progress",
-            ImportProgress {
-                statements_executed: executed,
-                total_statements: executed,
-                percentage: 100.0,
-                current_operation: "Import completed".to_string(),
-            },
-        );
+        $on_progress(ImportProgress {
+            statements_executed: executed,
+            total_statements: executed,
+            percentage: 100.0,
+            current_operation: "Import completed".to_string(),
+        });
 
         Ok::<usize, String>(executed)
     }};
@@ -654,14 +734,6 @@ pub async fn import_database<R: Runtime>(
         params.database = crate::models::DatabaseSelection::Single(db);
     }
     let driver = saved_conn.params.driver.clone();
-    // Postgres dump files reference unqualified table names expecting the
-    // default `public` schema, so only Postgres(-flavored plugin) statements
-    // need that default. A non-Postgres plugin driver's `schema` parameter
-    // may mean something else entirely (a database selector, for a
-    // MySQL-like plugin with no real schema concept) - defaulting it to
-    // "public" there could silently retarget the connection to a database
-    // that doesn't exist instead of leaving the plugin's own default alone.
-    let pg_schema = schema.clone().unwrap_or_else(|| "public".to_string());
     let app_handle = app.clone();
     let conn_id = connection_id.clone();
     let drv = crate::drivers::registry::get_connection_driver(&params).await?;
@@ -686,138 +758,18 @@ pub async fn import_database<R: Runtime>(
             },
         );
 
-        // Execute with transaction and optimizations for speed
-        match driver.as_str() {
-            "mysql" => {
-                let pool = get_mysql_pool(&params).await?;
-                let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
-
-                // Performance optimizations for MySQL
-                sqlx::query("SET FOREIGN_KEY_CHECKS=0")
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                sqlx::query("SET UNIQUE_CHECKS=0")
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                sqlx::query("SET AUTOCOMMIT=0")
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                macro_rules! execute_statement {
-                    ($stmt:expr) => {
-                        sqlx::query($stmt).execute(&mut *tx)
-                    };
-                }
-
-                execute_statements_streaming!(execute_statement, stream, app_handle)?;
-
-                // Restore settings
-                sqlx::query("SET FOREIGN_KEY_CHECKS=1")
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                sqlx::query("SET UNIQUE_CHECKS=1")
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                sqlx::query("SET AUTOCOMMIT=1")
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                tx.commit().await.map_err(|e| e.to_string())?;
-            }
-            "postgres" => {
-                let pool = get_postgres_pool(&params).await?;
-                let mut client = pool.get().await.map_err(|e| e.to_string())?;
-                let tx = client.transaction().await.map_err(|e| e.to_string())?;
-
-                // Set schema search path so unqualified table names resolve correctly
-                tx.execute(&format!("SET search_path TO \"{}\"", pg_schema), &[])
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                // Performance optimizations for PostgreSQL
-                tx.execute("SET CONSTRAINTS ALL DEFERRED", &[])
-                    .await
-                    .map_err(|e| e.to_string())?;
-                // Temporarily disable synchronous commit for speed (data at risk until commit)
-                tx.execute("SET LOCAL synchronous_commit=OFF", &[])
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                macro_rules! execute_statement {
-                    ($stmt:expr) => {
-                        tx.execute($stmt, &[])
-                    };
-                }
-
-                execute_statements_streaming!(execute_statement, stream, app_handle)?;
-
-                tx.commit().await.map_err(|e| e.to_string())?;
-            }
-            "sqlite" => {
-                use sqlx::Connection;
-
-                let pool = get_sqlite_pool(&params).await?;
-                let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
-                let saved = relax_sqlite_pragmas(&mut conn).await?;
-
-                let result = async {
-                    let mut tx = Connection::begin(&mut *conn)
-                        .await
-                        .map_err(|e| e.to_string())?;
-
-                    macro_rules! execute_statement {
-                        ($stmt:expr) => {
-                            sqlx::query($stmt).execute(&mut *tx)
-                        };
-                    }
-
-                    execute_statements_streaming!(execute_statement, stream, app_handle)?;
-
-                    tx.commit().await.map_err(|e| e.to_string())
-                }
-                .await;
-
-                // The connection goes back to the pool, so its settings are
-                // restored even when the import failed.
-                let restored = restore_sqlite_pragmas(&mut conn, &saved).await;
-                result?;
-                restored?;
-            }
-            // Any plugin-backed driver: no local pool to open a transaction
-            // on (the plugin owns its own pool inside its subprocess), and no
-            // cross-process RPC for transaction begin/commit/rollback exists
-            // yet. Execute each statement independently through the generic
-            // RPC surface instead — correct (each call passes a schema so
-            // schema-scoping doesn't depend on session state persisting
-            // across pooled connections, unlike the builtin arms' `SET
-            // search_path`), but NOT atomic: unlike the builtin drivers
-            // above, a failure partway through leaves whatever ran so far
-            // committed rather than rolling the whole import back. A
-            // transactional bulk-execute RPC would need to be added to the
-            // plugin protocol to close that gap (followed up separately).
-            _ => {
-                // Only default to "public" for a Postgres-flavored plugin
-                // (see `pg_schema` above).
-                let fallback_schema = if is_postgres {
-                    Some(pg_schema.as_str())
-                } else {
-                    schema.as_deref()
-                };
-                macro_rules! execute_statement {
-                    ($stmt:expr) => {
-                        drv.execute_query(&params, $stmt, None, 1, fallback_schema)
-                    };
-                }
-
-                execute_statements_streaming!(execute_statement, stream, app_handle)?;
-            }
-        }
+        execute_statements(
+            &mut stream,
+            &drv,
+            &params,
+            &driver,
+            schema.as_deref(),
+            is_postgres,
+            &|progress| {
+                let _ = app_handle.emit("import_progress", progress);
+            },
+        )
+        .await?;
 
         Ok::<(), String>(())
     });
@@ -834,6 +786,164 @@ pub async fn import_database<R: Runtime>(
         Ok(res) => res,
         Err(_) => Err("Import cancelled".into()),
     }
+}
+
+/// Runs every statement from `source` on the connection described by
+/// `params`, inside one transaction on the built-in drivers, with foreign key
+/// checks off. Shared by Import (a dump file) and Copy Database (statements
+/// streamed from another connection).
+pub(crate) async fn execute_statements(
+    source: &mut dyn StatementSource,
+    drv: &Arc<dyn DatabaseDriver>,
+    params: &ConnectionParams,
+    driver: &str,
+    schema: Option<&str>,
+    is_postgres: bool,
+    on_progress: &(dyn Fn(ImportProgress) + Send + Sync),
+) -> Result<(), String> {
+    // Postgres dump files reference unqualified table names expecting the
+    // default `public` schema, so only Postgres(-flavored plugin) statements
+    // need that default. A non-Postgres plugin driver's `schema` parameter
+    // may mean something else entirely (a database selector, for a
+    // MySQL-like plugin with no real schema concept) - defaulting it to
+    // "public" there could silently retarget the connection to a database
+    // that doesn't exist instead of leaving the plugin's own default alone.
+    let pg_schema = schema.unwrap_or("public").to_string();
+
+    // Execute with transaction and optimizations for speed
+    match driver {
+        "mysql" => {
+            let pool = get_mysql_pool(params).await?;
+            let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+
+            // Performance optimizations for MySQL
+            sqlx::query("SET FOREIGN_KEY_CHECKS=0")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query("SET UNIQUE_CHECKS=0")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query("SET AUTOCOMMIT=0")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            macro_rules! execute_statement {
+                ($stmt:expr) => {
+                    sqlx::query($stmt).execute(&mut *tx)
+                };
+            }
+
+            execute_statements_streaming!(execute_statement, source, on_progress)?;
+
+            // Restore settings
+            sqlx::query("SET FOREIGN_KEY_CHECKS=1")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query("SET UNIQUE_CHECKS=1")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query("SET AUTOCOMMIT=1")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            tx.commit().await.map_err(|e| e.to_string())?;
+        }
+        "postgres" => {
+            let pool = get_postgres_pool(params).await?;
+            let mut client = pool.get().await.map_err(|e| e.to_string())?;
+            let tx = client.transaction().await.map_err(|e| e.to_string())?;
+
+            // Set schema search path so unqualified table names resolve correctly
+            tx.execute(&format!("SET search_path TO \"{}\"", pg_schema), &[])
+                .await
+                .map_err(|e| e.to_string())?;
+
+            // Performance optimizations for PostgreSQL
+            tx.execute("SET CONSTRAINTS ALL DEFERRED", &[])
+                .await
+                .map_err(|e| e.to_string())?;
+            // Temporarily disable synchronous commit for speed (data at risk until commit)
+            tx.execute("SET LOCAL synchronous_commit=OFF", &[])
+                .await
+                .map_err(|e| e.to_string())?;
+
+            macro_rules! execute_statement {
+                ($stmt:expr) => {
+                    tx.execute($stmt, &[])
+                };
+            }
+
+            execute_statements_streaming!(execute_statement, source, on_progress)?;
+
+            tx.commit().await.map_err(|e| e.to_string())?;
+        }
+        "sqlite" => {
+            use sqlx::Connection;
+
+            let pool = get_sqlite_pool(params).await?;
+            let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
+            let saved = relax_sqlite_pragmas(&mut conn).await?;
+
+            let result = async {
+                let mut tx = Connection::begin(&mut *conn)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                macro_rules! execute_statement {
+                    ($stmt:expr) => {
+                        sqlx::query($stmt).execute(&mut *tx)
+                    };
+                }
+
+                execute_statements_streaming!(execute_statement, source, on_progress)?;
+
+                tx.commit().await.map_err(|e| e.to_string())
+            }
+            .await;
+
+            // The connection goes back to the pool, so its settings are
+            // restored even when the import failed.
+            let restored = restore_sqlite_pragmas(&mut conn, &saved).await;
+            result?;
+            restored?;
+        }
+        // Any plugin-backed driver: no local pool to open a transaction
+        // on (the plugin owns its own pool inside its subprocess), and no
+        // cross-process RPC for transaction begin/commit/rollback exists
+        // yet. Execute each statement independently through the generic
+        // RPC surface instead — correct (each call passes a schema so
+        // schema-scoping doesn't depend on session state persisting
+        // across pooled connections, unlike the builtin arms' `SET
+        // search_path`), but NOT atomic: unlike the builtin drivers
+        // above, a failure partway through leaves whatever ran so far
+        // committed rather than rolling the whole import back. A
+        // transactional bulk-execute RPC would need to be added to the
+        // plugin protocol to close that gap (followed up separately).
+        _ => {
+            // Only default to "public" for a Postgres-flavored plugin
+            // (see `pg_schema` above).
+            let fallback_schema = if is_postgres {
+                Some(pg_schema.as_str())
+            } else {
+                schema
+            };
+            macro_rules! execute_statement {
+                ($stmt:expr) => {
+                    drv.execute_query(params, $stmt, None, 1, fallback_schema)
+                };
+            }
+
+            execute_statements_streaming!(execute_statement, source, on_progress)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// The settings an import relaxes on a SQLite connection, as they were.
@@ -1035,40 +1145,109 @@ mod tests {
         assert!(!plugin_dump_has_more(None, 0, 1000));
     }
 
-    #[tokio::test]
-    async fn test_export_table_data_keeps_binary_values_whole() {
-        // Regression: binary values were written in the data grid's display
-        // format ("BLOB:<size>:<mime>:<base64 preview>"), truncated at 10 KB.
-        let db = tempfile::NamedTempFile::new().unwrap();
+    async fn sqlite_fixture(
+        setup: &[&str],
+    ) -> (
+        ConnectionParams,
+        Arc<dyn DatabaseDriver>,
+        tempfile::NamedTempFile,
+    ) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap().to_string();
         let params = ConnectionParams {
             driver: "sqlite".to_string(),
-            database: crate::models::DatabaseSelection::Single(
-                db.path().to_str().unwrap().to_string(),
-            ),
+            database: crate::models::DatabaseSelection::Single(path),
             ..Default::default()
         };
         let pool = get_sqlite_pool(&params).await.unwrap();
-        for sql in [
-            "CREATE TABLE b (id INTEGER PRIMARY KEY, data BLOB)",
-            "INSERT INTO b VALUES (1, X'00FF10'), (2, zeroblob(20000)), (3, NULL), (4, X'')",
-        ] {
+        for sql in setup {
             sqlx::query(sql).execute(&pool).await.unwrap();
         }
         let drv: Arc<dyn DatabaseDriver> = Arc::new(crate::drivers::sqlite::SqliteDriver::new());
-        let dialect = DumpDialect::from_capabilities("sqlite", &drv.manifest().capabilities);
+        (params, drv, file)
+    }
 
+    #[tokio::test]
+    async fn test_write_dump_file_layout_is_unchanged() {
+        let (params, drv, _db) = sqlite_fixture(&[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+            "INSERT INTO t VALUES (1, 'a''b'), (2, NULL)",
+        ])
+        .await;
         let out = tempfile::NamedTempFile::new().unwrap();
-        {
-            let mut writer = BufWriter::new(File::create(out.path()).unwrap());
-            export_table_data(&mut writer, &drv, &params, "sqlite", &dialect, "b", None)
-                .await
-                .unwrap();
-            writer.flush().unwrap();
-        }
+        let mut sink = FileDumpSink::create(out.path().to_str().unwrap()).unwrap();
+        let dialect = DumpDialect::from_capabilities("sqlite", &drv.manifest().capabilities);
+        write_dump(
+            &mut sink,
+            &drv,
+            &params,
+            "sqlite",
+            &dialect,
+            None,
+            &DumpPlan {
+                tables: &["t".to_string()],
+                structure: true,
+                data: true,
+                drop_existing: true,
+            },
+            &|_, _| {},
+        )
+        .await
+        .unwrap();
+        sink.flush().unwrap();
+        drop(sink);
+
+        // The layout Export has always written (see git history of
+        // `dump_database`): comment, DROP, CREATE, blank line, comment,
+        // INSERT batches, two blank lines.
+        assert_eq!(
+            std::fs::read_to_string(out.path()).unwrap(),
+            "-- Structure for table \"t\"\n\
+             DROP TABLE IF EXISTS \"t\";\n\
+             CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);\n\
+             \n\
+             -- Data for table \"t\"\n\
+             INSERT INTO \"t\" VALUES (1, 'a''b'), (2, NULL);\n\
+             \n\
+             \n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_dump_keeps_binary_values_whole() {
+        // Regression: binary values were written in the data grid's display
+        // format ("BLOB:<size>:<mime>:<base64 preview>"), truncated at 10 KB.
+        let (params, drv, _db) = sqlite_fixture(&[
+            "CREATE TABLE b (id INTEGER PRIMARY KEY, data BLOB)",
+            "INSERT INTO b VALUES (1, X'00FF10'), (2, zeroblob(20000)), (3, NULL)",
+        ])
+        .await;
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let mut sink = FileDumpSink::create(out.path().to_str().unwrap()).unwrap();
+        let dialect = DumpDialect::from_capabilities("sqlite", &drv.manifest().capabilities);
+        write_dump(
+            &mut sink,
+            &drv,
+            &params,
+            "sqlite",
+            &dialect,
+            None,
+            &DumpPlan {
+                tables: &["b".to_string()],
+                structure: false,
+                data: true,
+                drop_existing: false,
+            },
+            &|_, _| {},
+        )
+        .await
+        .unwrap();
+        sink.flush().unwrap();
+        drop(sink);
 
         let dump = std::fs::read_to_string(out.path()).unwrap();
         let expected = format!(
-            "INSERT INTO \"b\" VALUES (1, X'00ff10'), (2, X'{}'), (3, NULL), (4, X'');",
+            "INSERT INTO \"b\" VALUES (1, X'00ff10'), (2, X'{}'), (3, NULL);",
             "00".repeat(20000)
         );
         assert!(
@@ -1119,5 +1298,28 @@ mod tests {
 
         let after = relax_sqlite_pragmas(&mut conn).await.unwrap();
         assert_eq!(after, saved, "settings are back to what they were");
+    }
+
+    #[tokio::test]
+    async fn test_execute_statements_imports_into_sqlite() {
+        // Regression: the SQLite import set `PRAGMA synchronous` inside its
+        // transaction, which SQLite rejects, so every SQLite import failed.
+        let (params, drv, _db) = sqlite_fixture(&[]).await;
+        let dump = "CREATE TABLE p (id INTEGER PRIMARY KEY);\n\
+                    CREATE TABLE c (id INTEGER, p_id INTEGER REFERENCES p(id));\n\
+                    -- child rows first: foreign keys are off during the import\n\
+                    INSERT INTO c VALUES (1, 7);\n\
+                    INSERT INTO p VALUES (7);\n";
+        let mut stream = SqlStatementStream::new(std::io::Cursor::new(dump.as_bytes().to_vec()));
+        execute_statements(&mut stream, &drv, &params, "sqlite", None, false, &|_| {})
+            .await
+            .unwrap();
+
+        let pool = get_sqlite_pool(&params).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM c JOIN p ON p.id = c.p_id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

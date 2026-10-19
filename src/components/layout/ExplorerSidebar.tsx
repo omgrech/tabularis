@@ -74,6 +74,7 @@ import { CreateIndexModal } from "../modals/CreateIndexModal";
 import { CreateForeignKeyModal } from "../modals/CreateForeignKeyModal";
 import { GenerateSQLModal } from "../modals/GenerateSQLModal";
 import { DumpDatabaseModal } from "../modals/DumpDatabaseModal";
+import { CopyDatabaseModal } from "../modals/CopyDatabaseModal";
 import { ImportDatabaseModal } from "../modals/ImportDatabaseModal";
 import { ClipboardImportModal } from "../modals/ClipboardImportModal";
 import { ViewEditorModal } from "../modals/ViewEditorModal";
@@ -112,7 +113,7 @@ import { SqlHighlight } from "../ui/SqlHighlight";
 import { SqlMatchExcerpt } from "../ui/SqlMatchExcerpt";
 import { getSavedQueryExcerpt, matchesSavedQuery } from "../../utils/savedQuerySearch";
 import { isMultiDatabaseCapable, isSchemaBasedMultiDb, usesMultiDatabaseLayout, reconcileDatabaseSelection } from "../../utils/database";
-import { supportsManageTables } from "../../utils/driverCapabilities";
+import { isReadonly, supportsManageTables } from "../../utils/driverCapabilities";
 import { newConsoleForDatabase } from "../../utils/newConsole";
 import { openEditor } from "../../utils/editorNavigation";
 import {
@@ -301,6 +302,7 @@ export const ExplorerSidebar = ({ sidebarWidth, startResize, onCollapse, sidebar
     query?: SavedQuery;
   }>({ isOpen: false });
   const [dumpModal, setDumpModal] = useState<{ database: string; schema?: string } | null>(null);
+  const [copyDatabaseModal, setCopyDatabaseModal] = useState<{ database: string } | null>(null);
   const [importModal, setImportModal] = useState<{
     filePath: string;
     database: string;
@@ -906,6 +908,18 @@ export const ExplorerSidebar = ({ sidebarWidth, startResize, onCollapse, sidebar
                         <Download size={16} className="text-accent shrink-0" />
                         <span>{t("dump.dumpDatabase")}</span>
                       </button>
+                      {!isReadonly(activeCapabilities) && (
+                        <button
+                          onClick={() => {
+                            setCopyDatabaseModal({ database: activeDatabaseName ?? "" });
+                            setIsActionsDropdownOpen(false);
+                          }}
+                          className="w-full flex items-center gap-3 px-3 py-2 text-sm text-secondary hover:bg-surface-secondary hover:text-primary transition-colors text-left whitespace-nowrap"
+                        >
+                          <Copy size={16} className="text-accent-secondary shrink-0" />
+                          <span>{t("copyDatabase.menu")}</span>
+                        </button>
+                      )}
                       <button
                         onClick={async () => {
                           try {
@@ -957,6 +971,16 @@ export const ExplorerSidebar = ({ sidebarWidth, startResize, onCollapse, sidebar
                 >
                   <Download size={16} />
                 </button>
+                {!isReadonly(activeCapabilities) && (
+                  <button
+                    onClick={() => setCopyDatabaseModal({ database: activeDatabaseName ?? "" })}
+                    className="text-muted hover:text-accent-secondary transition-colors p-1 hover:bg-surface-secondary rounded"
+                    title={t("copyDatabase.menu")}
+                    aria-label={t("copyDatabase.menu")}
+                  >
+                    <Copy size={16} />
+                  </button>
+                )}
                 <button
                   onClick={async () => {
                     try {
@@ -2987,6 +3011,15 @@ export const ExplorerSidebar = ({ sidebarWidth, startResize, onCollapse, sidebar
                                   icon: Download,
                                   action: () => setDumpModal({ database: contextMenu.id }),
                                 },
+                                ...(isReadonly(activeCapabilities)
+                                  ? []
+                                  : [
+                                      {
+                                        label: t("copyDatabase.menu"),
+                                        icon: Copy,
+                                        action: () => setCopyDatabaseModal({ database: contextMenu.id }),
+                                      },
+                                    ]),
                                 {
                                   label: t("sidebar.viewERDiagram"),
                                   icon: Network,
@@ -3312,6 +3345,26 @@ export const ExplorerSidebar = ({ sidebarWidth, startResize, onCollapse, sidebar
           ).map((t) => t.name)}
           schema={dumpModal.schema}
           database={dumpModal.schema ? dumpModal.database : undefined}
+        />
+      )}
+
+      {copyDatabaseModal && activeConnectionId && (
+        <CopyDatabaseModal
+          isOpen={true}
+          onClose={() => setCopyDatabaseModal(null)}
+          connectionId={activeConnectionId}
+          databaseName={copyDatabaseModal.database || activeDatabaseName || ""}
+          database={isMultiDb ? copyDatabaseModal.database : undefined}
+          schema={activeSchema ?? undefined}
+          onCopied={(targetConnectionId, targetDatabase) => {
+            // Show the new tables when they landed in this connection.
+            if (targetConnectionId !== activeConnectionId) return;
+            if (isMultiDb && targetDatabase) {
+              refreshDatabaseData(targetDatabase);
+            } else {
+              refreshTables?.();
+            }
+          }}
         />
       )}
 

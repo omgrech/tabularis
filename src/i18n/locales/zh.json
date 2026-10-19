@@ -2008,6 +2008,27 @@
     "confirmImport": "确定要导入 \"{{file}}\" 吗？\n这可能会覆盖现有数据。",
     "elapsedTime": "已用时间"
   },
+  "copyDatabase": {
+    "menu": "复制到其他数据库...",
+    "title": "复制数据库",
+    "subtitle": "来源：{{connection}} / {{database}}",
+    "tables": "表 ({{selected}}/{{total}})",
+    "loading": "正在加载表",
+    "targetConnection": "目标连接",
+    "targetDatabase": "目标数据库",
+    "whatToCopy": "复制内容",
+    "structureAndData": "结构和数据",
+    "structureOnly": "仅结构",
+    "dropExisting": "删除目标中已存在的表",
+    "dropExistingWarning": "同名的现有表将连同其全部数据被删除并替换。",
+    "note": "不会复制视图、例程和触发器。两端必须使用相同类型的数据库。",
+    "starting": "正在开始复制...",
+    "progress": "正在复制 {{table}}（第 {{current}} / {{total}} 个）",
+    "success": "复制完成。",
+    "copy": "复制",
+    "errorNoTables": "请至少选择一个表。",
+    "errorSameDatabase": "请选择其他目标数据库。"
+  },
   "geometryInput": {
     "sqlMode": "SQL 模式",
     "wktMode": "WKT 模式",

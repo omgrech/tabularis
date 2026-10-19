@@ -2160,6 +2160,27 @@
     "confirmImport": "Are you sure you want to import \"{{file}}\"?\nThis may overwrite existing data.",
     "elapsedTime": "Elapsed time"
   },
+  "copyDatabase": {
+    "menu": "Copy to Another Database...",
+    "title": "Copy Database",
+    "subtitle": "From {{connection}} / {{database}}",
+    "tables": "Tables ({{selected}}/{{total}})",
+    "loading": "Loading tables",
+    "targetConnection": "Target connection",
+    "targetDatabase": "Target database",
+    "whatToCopy": "What to copy",
+    "structureAndData": "Structure and data",
+    "structureOnly": "Structure only",
+    "dropExisting": "Drop tables that already exist in the target",
+    "dropExistingWarning": "Existing tables with the same name are deleted and replaced, with all their data.",
+    "note": "Views, routines and triggers are not copied. Both sides must use the same database type.",
+    "starting": "Starting copy...",
+    "progress": "Copying {{table}} ({{current}} of {{total}})",
+    "success": "Copy completed.",
+    "copy": "Copy",
+    "errorNoTables": "Select at least one table.",
+    "errorSameDatabase": "Choose a different target database."
+  },
   "geometryInput": {
     "sqlMode": "SQL Mode",
     "wktMode": "WKT Mode",

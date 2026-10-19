@@ -2119,6 +2119,27 @@
     "confirmImport": "Sigurado ka bang gusto mong i-import ang \"{{file}}\"?\nMaaari nitong i-overwrite ang umiiral na data.",
     "elapsedTime": "Oras na lumipas"
   },
+  "copyDatabase": {
+    "menu": "Kopyahin sa Ibang Database...",
+    "title": "Kopyahin ang Database",
+    "subtitle": "Mula sa {{connection}} / {{database}}",
+    "tables": "Mga table ({{selected}}/{{total}})",
+    "loading": "Nilo-load ang mga table",
+    "targetConnection": "Target na connection",
+    "targetDatabase": "Target na database",
+    "whatToCopy": "Ano ang kokopyahin",
+    "structureAndData": "Structure at data",
+    "structureOnly": "Structure lang",
+    "dropExisting": "Burahin ang mga table na mayroon na sa target",
+    "dropExistingWarning": "Ang mga umiiral na table na may parehong pangalan ay buburahin at papalitan, kasama ang lahat ng data nila.",
+    "note": "Hindi kinokopya ang mga view, routine at trigger. Dapat parehong uri ng database ang dalawang panig.",
+    "starting": "Sinisimulan ang pagkopya...",
+    "progress": "Kinokopya ang {{table}} ({{current}} sa {{total}})",
+    "success": "Tapos na ang pagkopya.",
+    "copy": "Kopyahin",
+    "errorNoTables": "Pumili ng kahit isang table.",
+    "errorSameDatabase": "Pumili ng ibang target na database."
+  },
   "geometryInput": {
     "sqlMode": "SQL Mode",
     "wktMode": "WKT Mode",

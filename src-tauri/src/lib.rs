@@ -37,6 +37,7 @@ pub mod connection_tags;
 pub mod connection_window;
 #[cfg(test)]
 pub mod connection_window_tests;
+pub mod copy_database;
 pub mod credential_cache;
 pub mod dump_commands; // Added
 #[cfg(test)]
@@ -775,6 +776,8 @@ pub fn run() {
             dump_commands::cancel_dump,
             dump_commands::import_database,
             dump_commands::cancel_import,
+            copy_database::copy_database,
+            copy_database::cancel_copy_database,
             dump_commands::cancel_dump,
             // Updater
             updater::check_for_updates,

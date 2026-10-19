@@ -2100,6 +2100,27 @@
     "confirmImport": "「{{file}}」をインポートしてもよろしいですか？\n既存のデータが上書きされる可能性があります。",
     "elapsedTime": "経過時間"
   },
+  "copyDatabase": {
+    "menu": "別のデータベースにコピー...",
+    "title": "データベースをコピー",
+    "subtitle": "コピー元: {{connection}} / {{database}}",
+    "tables": "テーブル ({{selected}}/{{total}})",
+    "loading": "テーブルを読み込み中",
+    "targetConnection": "コピー先の接続",
+    "targetDatabase": "コピー先のデータベース",
+    "whatToCopy": "コピーする内容",
+    "structureAndData": "構造とデータ",
+    "structureOnly": "構造のみ",
+    "dropExisting": "コピー先に既にあるテーブルを削除",
+    "dropExistingWarning": "同じ名前の既存テーブルはデータごと削除され、置き換えられます。",
+    "note": "ビュー、ルーチン、トリガーはコピーされません。両側で同じ種類のデータベースを使う必要があります。",
+    "starting": "コピーを開始しています...",
+    "progress": "{{table}} をコピー中 ({{current}} / {{total}})",
+    "success": "コピーが完了しました。",
+    "copy": "コピー",
+    "errorNoTables": "テーブルを1つ以上選択してください。",
+    "errorSameDatabase": "別のコピー先データベースを選んでください。"
+  },
   "geometryInput": {
     "sqlMode": "SQL モード",
     "wktMode": "WKT モード",

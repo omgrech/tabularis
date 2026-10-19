@@ -2063,6 +2063,27 @@
     "confirmImport": "\"{{file}}\"을(를) 가져오시겠습니까?\n기존 데이터를 덮어쓸 수 있습니다.",
     "elapsedTime": "경과 시간"
   },
+  "copyDatabase": {
+    "menu": "다른 데이터베이스로 복사...",
+    "title": "데이터베이스 복사",
+    "subtitle": "원본: {{connection}} / {{database}}",
+    "tables": "테이블 ({{selected}}/{{total}})",
+    "loading": "테이블 불러오는 중",
+    "targetConnection": "대상 연결",
+    "targetDatabase": "대상 데이터베이스",
+    "whatToCopy": "복사할 내용",
+    "structureAndData": "구조와 데이터",
+    "structureOnly": "구조만",
+    "dropExisting": "대상에 이미 있는 테이블 삭제",
+    "dropExistingWarning": "같은 이름의 기존 테이블은 데이터와 함께 삭제되고 대체됩니다.",
+    "note": "뷰, 루틴, 트리거는 복사되지 않습니다. 양쪽 모두 같은 종류의 데이터베이스여야 합니다.",
+    "starting": "복사를 시작하는 중...",
+    "progress": "{{table}} 복사 중 ({{current}}/{{total}})",
+    "success": "복사가 완료되었습니다.",
+    "copy": "복사",
+    "errorNoTables": "테이블을 하나 이상 선택하세요.",
+    "errorSameDatabase": "다른 대상 데이터베이스를 선택하세요."
+  },
   "geometryInput": {
     "sqlMode": "SQL 모드",
     "wktMode": "WKT 모드",

@@ -2103,6 +2103,27 @@
     "confirmImport": "Tem certeza que deseja importar \"{{file}}\"?\nIsso pode sobrescrever dados existentes.",
     "elapsedTime": "Tempo decorrido"
   },
+  "copyDatabase": {
+    "menu": "Copiar para outro banco de dados...",
+    "title": "Copiar banco de dados",
+    "subtitle": "De {{connection}} / {{database}}",
+    "tables": "Tabelas ({{selected}}/{{total}})",
+    "loading": "Carregando tabelas",
+    "targetConnection": "Conexão de destino",
+    "targetDatabase": "Banco de dados de destino",
+    "whatToCopy": "O que copiar",
+    "structureAndData": "Estrutura e dados",
+    "structureOnly": "Somente estrutura",
+    "dropExisting": "Excluir as tabelas que já existem no destino",
+    "dropExistingWarning": "Tabelas existentes com o mesmo nome são excluídas e substituídas, com todos os seus dados.",
+    "note": "Views, rotinas e triggers não são copiados. Os dois lados precisam usar o mesmo tipo de banco de dados.",
+    "starting": "Iniciando a cópia...",
+    "progress": "Copiando {{table}} ({{current}} de {{total}})",
+    "success": "Cópia concluída.",
+    "copy": "Copiar",
+    "errorNoTables": "Selecione pelo menos uma tabela.",
+    "errorSameDatabase": "Escolha outro banco de dados de destino."
+  },
   "geometryInput": {
     "sqlMode": "Modo SQL",
     "wktMode": "Modo WKT",
