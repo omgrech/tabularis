@@ -226,10 +226,23 @@ async fn export_table_data(
             while let Some(row) = rows.try_next().await.map_err(|e| e.to_string())? {
                 let mut values = Vec::new();
                 for i in 0..row.columns().len() {
+                    let type_name = row.column(i).type_info().name();
+                    // Binary columns are written from their raw bytes:
+                    // `extract_value` gives the data grid's display format
+                    // (a truncated base64 preview), which would corrupt them.
+                    if type_name.contains("BLOB") || type_name.contains("BINARY") {
+                        if let Ok(bytes) = row.try_get::<Option<Vec<u8>>, _>(i) {
+                            values.push(match bytes {
+                                Some(bytes) => dialect.binary_literal(&bytes),
+                                None => "NULL".to_string(),
+                            });
+                            continue;
+                        }
+                    }
                     let val = extract_value(&row, i, None);
                     // JSON columns are extracted as parsed values and must be
                     // written back as JSON literals, not as their string content.
-                    let is_json_column = row.column(i).type_info().name() == "JSON";
+                    let is_json_column = type_name == "JSON";
                     values.push(if is_json_column {
                         dialect.escape_json_value(val)
                     } else {
@@ -274,8 +287,18 @@ async fn export_table_data(
             while let Some(row) = rows.try_next().await.map_err(|e| e.to_string())? {
                 let mut values = Vec::new();
                 for i in 0..row.columns().len() {
-                    let val = extract_value(&row, i, None);
                     let column_type = row.columns()[i].type_();
+                    // See the MySQL arm: binary data is written from its raw bytes.
+                    if *column_type == tokio_postgres::types::Type::BYTEA {
+                        if let Ok(bytes) = row.try_get::<_, Option<Vec<u8>>>(i) {
+                            values.push(match bytes {
+                                Some(bytes) => dialect.binary_literal(&bytes),
+                                None => "NULL".to_string(),
+                            });
+                            continue;
+                        }
+                    }
+                    let val = extract_value(&row, i, None);
                     let is_json_column = *column_type == tokio_postgres::types::Type::JSON
                         || *column_type == tokio_postgres::types::Type::JSONB;
                     values.push(if is_json_column {
@@ -316,6 +339,21 @@ async fn export_table_data(
             while let Some(row) = rows.try_next().await.map_err(|e| e.to_string())? {
                 let mut values = Vec::new();
                 for i in 0..row.columns().len() {
+                    use sqlx::{TypeInfo, ValueRef};
+                    // SQLite types each value, not the column. See the MySQL
+                    // arm: binary data is written from its raw bytes.
+                    let is_blob = row
+                        .try_get_raw(i)
+                        // A NULL reports the column's declared type, so
+                        // it is checked first and stays NULL.
+                        .map(|raw| !raw.is_null() && raw.type_info().name() == "BLOB")
+                        .unwrap_or(false);
+                    if is_blob {
+                        if let Ok(bytes) = row.try_get::<Vec<u8>, _>(i) {
+                            values.push(dialect.binary_literal(&bytes));
+                            continue;
+                        }
+                    }
                     let val = extract_value(&row, i, None);
                     values.push(dialect.escape_value(val));
                 }
@@ -954,5 +992,49 @@ mod tests {
     #[test]
     fn test_plugin_dump_has_more_an_empty_page_without_pagination_ends_the_fetch() {
         assert!(!plugin_dump_has_more(None, 0, 1000));
+    }
+
+    #[tokio::test]
+    async fn test_export_table_data_keeps_binary_values_whole() {
+        // Regression: binary values were written in the data grid's display
+        // format ("BLOB:<size>:<mime>:<base64 preview>"), truncated at 10 KB.
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let params = ConnectionParams {
+            driver: "sqlite".to_string(),
+            database: crate::models::DatabaseSelection::Single(
+                db.path().to_str().unwrap().to_string(),
+            ),
+            ..Default::default()
+        };
+        let pool = get_sqlite_pool(&params).await.unwrap();
+        for sql in [
+            "CREATE TABLE b (id INTEGER PRIMARY KEY, data BLOB)",
+            "INSERT INTO b VALUES (1, X'00FF10'), (2, zeroblob(20000)), (3, NULL), (4, X'')",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
+        let drv: Arc<dyn DatabaseDriver> = Arc::new(crate::drivers::sqlite::SqliteDriver::new());
+        let dialect = DumpDialect::from_capabilities("sqlite", &drv.manifest().capabilities);
+
+        let out = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut writer = BufWriter::new(File::create(out.path()).unwrap());
+            export_table_data(&mut writer, &drv, &params, "sqlite", &dialect, "b", None)
+                .await
+                .unwrap();
+            writer.flush().unwrap();
+        }
+
+        let dump = std::fs::read_to_string(out.path()).unwrap();
+        let expected = format!(
+            "INSERT INTO \"b\" VALUES (1, X'00ff10'), (2, X'{}'), (3, NULL), (4, X'');",
+            "00".repeat(20000)
+        );
+        assert!(
+            dump.contains(&expected),
+            "{}",
+            &dump[dump.len().saturating_sub(200)..]
+        );
+        assert!(!dump.contains("BLOB:"));
     }
 }

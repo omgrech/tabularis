@@ -647,3 +647,18 @@ fn declared_backslash_escape_writes_nul_as_an_escape() {
     let dialect = DumpDialect::from_capabilities("bigquery", &caps);
     assert_eq!(dialect.escape_value(json!("a\u{0}b")), "'a\\0b'");
 }
+
+#[test]
+fn binary_values_are_written_as_hex_literals() {
+    let bytes = [0x00, 0xff, 0x10, b'\'', b'\\'];
+    assert_eq!(dialect_for("mysql").binary_literal(&bytes), "X'00ff10275c'");
+    assert_eq!(
+        dialect_for("sqlite").binary_literal(&bytes),
+        "X'00ff10275c'"
+    );
+    assert_eq!(
+        dialect_for("postgres").binary_literal(&bytes),
+        "decode('00ff10275c', 'hex')"
+    );
+    assert_eq!(dialect_for("mysql").binary_literal(&[]), "X''");
+}
