@@ -130,6 +130,11 @@
           "default": false,
           "description": "The explorer's Drop table action asks the optional get_drop_table_sql RPC for the statement. Without it the generic DROP TABLE is used and the RPC is never called."
         },
+        "clone_table": {
+          "type": "boolean",
+          "default": false,
+          "description": "Reserved for built-in drivers: enables the explorer's Clone table action. Plugins must leave it unset: there is no plugin RPC for cloning yet, so the action would fail."
+        },
         "no_connection_required": {
           "type": "boolean",
           "description": "API-based driver with no host/port/credentials. Hides the connection form entirely."
