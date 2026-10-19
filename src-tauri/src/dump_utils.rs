@@ -134,6 +134,22 @@ impl DumpDialect {
         quote_string_literal(s, self.string_escape)
     }
 
+    /// Writes binary data as a hex literal: `X'00ff10'`, or
+    /// `decode('00ff10', 'hex')` on PostgreSQL (a `bytea` value). Exact for
+    /// any content and size, and needs no escaping.
+    pub fn binary_literal(&self, bytes: &[u8]) -> String {
+        use std::fmt::Write;
+        let mut hex = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            let _ = write!(hex, "{:02x}", byte);
+        }
+        if self.postgres {
+            format!("decode('{}', 'hex')", hex)
+        } else {
+            format!("X'{}'", hex)
+        }
+    }
+
     /// Formats a value from a non-JSON column as a SQL literal.
     pub fn escape_value(&self, val: serde_json::Value) -> String {
         match val {
