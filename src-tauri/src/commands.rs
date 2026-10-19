@@ -7053,6 +7053,36 @@ pub async fn get_drop_table_sql<R: Runtime>(
         .await
 }
 
+/// Statements for the explorer's "Clone table" action, run by the caller in
+/// order through `execute_query`. Unlike the other DDL builders this one
+/// connects: drivers read the source table's columns (and, for SQLite, its
+/// stored definition and indexes).
+#[tauri::command]
+pub async fn get_clone_table_sql<R: Runtime>(
+    app: AppHandle<R>,
+    connection_id: String,
+    source: String,
+    target: String,
+    include_data: bool,
+    schema: Option<String>,
+    database: Option<String>,
+) -> Result<Vec<String>, String> {
+    let saved_conn = find_connection_by_id(&app, &connection_id)?;
+    let expanded_params = expand_ssh_connection_params(&app, &saved_conn.params).await?;
+    let expanded_params = expand_k8s_connection_params(&app, &expanded_params).await?;
+    let mut params = resolve_connection_params_with_id(&expanded_params, &connection_id)?;
+    if let Some(db) = database.filter(|d| !d.is_empty()) {
+        params.database = crate::models::DatabaseSelection::Single(db);
+    }
+    let drv = driver_for_params(&params).await?;
+    // Built-in drivers only for now: plugins have no RPC for this yet.
+    if !drv.manifest().is_builtin || !drv.manifest().capabilities.clone_table {
+        return Err("Cloning tables is not supported by this driver".into());
+    }
+    drv.get_clone_table_sql(&params, &source, &target, include_data, schema.as_deref())
+        .await
+}
+
 #[tauri::command]
 pub async fn drop_index_action<R: Runtime>(
     app: AppHandle<R>,

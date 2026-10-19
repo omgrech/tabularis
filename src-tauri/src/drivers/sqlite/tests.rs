@@ -1,4 +1,6 @@
 use super::sqlite_push_pk_where;
+use super::SqliteDriver;
+use crate::drivers::driver_trait::DatabaseDriver;
 use super::{
     alter_view, create_view, drop_view, get_all_columns_batch, get_columns, get_indexes,
     get_view_columns, get_view_definition, get_views, insert_record, parse_sqlite_index_columns,
@@ -611,4 +613,59 @@ async fn read_only_query_does_not_leak_into_the_pool() {
         .await
         .expect("writes still work after a read-only query");
     }
+}
+
+#[tokio::test]
+async fn clone_table_copies_structure_rows_and_indexes() {
+    let (params, _file) = setup_test_db().await;
+    let pool = crate::pool_manager::get_sqlite_pool(&params).await.unwrap();
+    sqlx::query("CREATE INDEX idx_users_name ON users (name)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let driver = SqliteDriver::new();
+    for (target, include_data, expected_rows) in [("users_full", true, 2), ("users_empty", false, 0)] {
+        let statements = driver
+            .get_clone_table_sql(&params, "users", target, include_data, None)
+            .await
+            .unwrap();
+        for sql in &statements {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
+
+        let (rows,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM \"{target}\""))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, expected_rows, "{target}");
+
+        let columns = get_columns(&params, target).await.unwrap();
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "name"]);
+        assert!(columns[0].is_pk);
+
+        let (indexes,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name = ?",
+        )
+        .bind(target)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(indexes, 1, "{target}");
+    }
+}
+
+#[tokio::test]
+async fn clone_table_rejects_same_or_blank_name() {
+    let (params, _file) = setup_test_db().await;
+    let driver = SqliteDriver::new();
+    assert!(driver
+        .get_clone_table_sql(&params, "users", "users", true, None)
+        .await
+        .is_err());
+    assert!(driver
+        .get_clone_table_sql(&params, "users", "  ", true, None)
+        .await
+        .is_err());
 }

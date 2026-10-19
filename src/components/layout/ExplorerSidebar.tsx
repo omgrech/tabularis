@@ -4,6 +4,7 @@ import { useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { quoteIdentifier } from "../../utils/identifiers";
 import { buildDropTableSql } from "../../utils/dropTable";
+import { runCloneTableStatements } from "../../utils/cloneTable";
 import { formatObjectNameForCopy, type ObjectNameCopyFormat } from "../../utils/objectNameCopy";
 import { isPostgresDriver, triggerFunctionName } from "../../utils/triggerSql";
 import { invoke } from "@tauri-apps/api/core";
@@ -20,6 +21,7 @@ import {
   Hash,
   FileText,
   Copy,
+  CopyPlus,
   ClipboardList,
   Loader2,
   Download,
@@ -73,6 +75,7 @@ import { ModifyColumnModal } from "../modals/ModifyColumnModal";
 import { CreateIndexModal } from "../modals/CreateIndexModal";
 import { CreateForeignKeyModal } from "../modals/CreateForeignKeyModal";
 import { GenerateSQLModal } from "../modals/GenerateSQLModal";
+import { CloneTableModal } from "../modals/CloneTableModal";
 import { DumpDatabaseModal } from "../modals/DumpDatabaseModal";
 import { ImportDatabaseModal } from "../modals/ImportDatabaseModal";
 import { ClipboardImportModal } from "../modals/ClipboardImportModal";
@@ -112,7 +115,7 @@ import { SqlHighlight } from "../ui/SqlHighlight";
 import { SqlMatchExcerpt } from "../ui/SqlMatchExcerpt";
 import { getSavedQueryExcerpt, matchesSavedQuery } from "../../utils/savedQuerySearch";
 import { isMultiDatabaseCapable, isSchemaBasedMultiDb, usesMultiDatabaseLayout, reconcileDatabaseSelection } from "../../utils/database";
-import { supportsManageTables } from "../../utils/driverCapabilities";
+import { supportsCloneTable, supportsManageTables } from "../../utils/driverCapabilities";
 import { newConsoleForDatabase } from "../../utils/newConsole";
 import { openEditor } from "../../utils/editorNavigation";
 import {
@@ -274,6 +277,7 @@ export const ExplorerSidebar = ({ sidebarWidth, startResize, onCollapse, sidebar
   }>({ isOpen: false, tableName: "" });
   const [generateSQLModal, setGenerateSQLModal] =
     useState<TableTarget | null>(null);
+  const [cloneTableModal, setCloneTableModal] = useState<TableTarget | null>(null);
   const setSidebarTab = onSidebarTabChange;
   const [historyToFavoriteSQL, setHistoryToFavoriteSQL] = useState<string | null>(null);
   const [historyToFavoriteDB, setHistoryToFavoriteDB] = useState<string | null>(null);
@@ -398,6 +402,49 @@ export const ExplorerSidebar = ({ sidebarWidth, startResize, onCollapse, sidebar
       refreshDatabaseData(schema);
     } else {
       fallback();
+    }
+  };
+
+  /**
+   * Clones `target` as `newName` with the statements the driver builds,
+   * run one by one like Delete Table runs its DROP. If a step after the
+   * CREATE fails, the half-made copy is dropped again.
+   */
+  const cloneTable = async (target: TableTarget, newName: string, includeData: boolean) => {
+    const scope = {
+      ...(target.schema ? { schema: target.schema } : {}),
+      ...(target.database ? { database: target.database } : {}),
+    };
+    const statements = await invoke<string[]>("get_clone_table_sql", {
+      connectionId: target.connectionId,
+      source: target.tableName,
+      target: newName,
+      includeData,
+      ...scope,
+    });
+    const execute = (query: string) =>
+      invoke("execute_query", { connectionId: target.connectionId, query, ...scope });
+    const dropNewTable = async () =>
+      execute(
+        await buildDropTableSql(
+          activeCapabilities,
+          () =>
+            invoke<unknown>("get_drop_table_sql", {
+              connectionId: target.connectionId,
+              table: newName,
+              ...scope,
+            }),
+          newName,
+          activeCapabilities ?? activeDriver,
+          target.schema,
+        ),
+      );
+    try {
+      await runCloneTableStatements(statements, execute, dropNewTable);
+    } finally {
+      refreshObjectScope(target.schema, target.database, () => {
+        refreshTables?.();
+      });
     }
   };
 
@@ -2476,6 +2523,17 @@ export const ExplorerSidebar = ({ sidebarWidth, startResize, onCollapse, sidebar
                       action: () =>
                         setModifyColumnModal({ isOpen: true, tableName: contextMenu.id, column: null, schema: ctxSchema, database: ctxDatabase }),
                     } : null,
+                    supportsCloneTable(activeCapabilities) && activeConnectionId ? {
+                      label: t("sidebar.cloneTable"),
+                      icon: CopyPlus,
+                      action: () =>
+                        setCloneTableModal({
+                          connectionId: activeConnectionId,
+                          tableName: contextMenu.id,
+                          schema: ctxSchema,
+                          database: ctxDatabase,
+                        }),
+                    } : null,
                     supportsManageTables(activeCapabilities) ? {
                       label: t("sidebar.deleteTable"),
                       icon: Trash2,
@@ -3292,6 +3350,15 @@ export const ExplorerSidebar = ({ sidebarWidth, startResize, onCollapse, sidebar
           isOpen={true}
           target={generateSQLModal}
           onClose={() => setGenerateSQLModal(null)}
+        />
+      )}
+
+      {cloneTableModal && (
+        <CloneTableModal
+          isOpen={true}
+          tableName={cloneTableModal.tableName}
+          onClose={() => setCloneTableModal(null)}
+          onSubmit={(newName, includeData) => cloneTable(cloneTableModal, newName, includeData)}
         />
       )}
 

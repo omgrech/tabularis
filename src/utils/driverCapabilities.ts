@@ -40,6 +40,13 @@ export function supportsPluginDropTableSql(
   return capabilities?.drop_table_sql === true;
 }
 
+/** The explorer can clone tables (structure, optionally rows) for this driver. */
+export function supportsCloneTable(
+  capabilities?: DriverCapabilities | null,
+): boolean {
+  return supportsManageTables(capabilities) && capabilities?.clone_table === true;
+}
+
 export function supportsCreateForeignKeys(
   capabilities?: DriverCapabilities | null,
 ): boolean {

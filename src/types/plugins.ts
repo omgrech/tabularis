@@ -57,6 +57,8 @@ export interface DriverCapabilities {
   column_comments?: boolean;
   /** Opts the explorer's Drop table action into the optional get_drop_table_sql RPC. Defaults to false. */
   drop_table_sql?: boolean;
+  /** Built-in drivers that back the explorer's Clone table action (get_clone_table_sql). Defaults to false. */
+  clone_table?: boolean;
   // DDL capabilities (optional, default to false when not present)
   alter_column?: boolean;
   create_foreign_keys?: boolean;

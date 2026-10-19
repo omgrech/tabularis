@@ -141,6 +141,7 @@ vi.mock("lucide-react", () => ({
   LayoutGrid: () => null,
   Settings: () => null,
   Copy: () => null,
+  CopyPlus: () => null,
   Link: () => null,
   Eye: () => null,
   EyeOff: () => null,

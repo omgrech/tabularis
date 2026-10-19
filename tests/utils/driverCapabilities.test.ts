@@ -5,6 +5,7 @@ import {
   supportsCreateForeignKeys,
   supportsColumnComments,
   supportsPluginDropTableSql,
+  supportsCloneTable,
   supportsExplain,
   supportsInMemoryDatabase,
   findDriverManifest,
@@ -99,6 +100,20 @@ describe('driverCapabilities', () => {
     it('should return false when capabilities are null or undefined', () => {
       expect(supportsColumnComments(null)).toBe(false);
       expect(supportsColumnComments(undefined)).toBe(false);
+    });
+  });
+
+  describe('supportsCloneTable', () => {
+    it('should return true when the driver declares clone_table and manages tables', () => {
+      expect(supportsCloneTable(makeCapabilities({ clone_table: true }))).toBe(true);
+    });
+
+    it('should return false when clone_table is missing, tables are not managed or the driver is read-only', () => {
+      expect(supportsCloneTable(makeCapabilities())).toBe(false);
+      expect(supportsCloneTable(makeCapabilities({ clone_table: true, manage_tables: false }))).toBe(false);
+      expect(supportsCloneTable(makeCapabilities({ clone_table: true, readonly: true }))).toBe(false);
+      expect(supportsCloneTable(null)).toBe(false);
+      expect(supportsCloneTable(undefined)).toBe(false);
     });
   });
 

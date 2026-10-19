@@ -131,6 +131,10 @@ pub struct DriverCapabilities {
     /// and the RPC is never called.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub drop_table_sql: bool,
+    /// The driver implements `get_clone_table_sql`, which backs the
+    /// explorer's "Clone table" action. Omitted/false hides the action.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clone_table: bool,
     // DDL capabilities
     /// Supports ALTER TABLE MODIFY/ALTER COLUMN on existing tables.
     #[serde(default)]
@@ -1020,6 +1024,21 @@ pub trait DatabaseDriver: Send + Sync {
         _schema: Option<&str>,
     ) -> Result<Option<String>, String> {
         Ok(None)
+    }
+
+    /// Statements that copy `source` to a new table `target` in the same
+    /// schema: its structure and, when `include_data` is set, every row.
+    /// The caller runs them in order. Only drivers declaring
+    /// `capabilities.clone_table` are asked.
+    async fn get_clone_table_sql(
+        &self,
+        _params: &ConnectionParams,
+        _source: &str,
+        _target: &str,
+        _include_data: bool,
+        _schema: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        Err("Cloning tables is not supported by this driver".into())
     }
 
     /// Returns the DDL (e.g. `CREATE TABLE ...`) for an *existing* table, as

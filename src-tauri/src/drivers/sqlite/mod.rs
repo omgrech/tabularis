@@ -2,8 +2,11 @@ pub mod export;
 pub mod extract;
 pub mod types;
 
+mod clone_table;
 mod explain;
 
+#[cfg(test)]
+mod clone_table_tests;
 #[cfg(test)]
 mod tests;
 
@@ -641,6 +644,21 @@ pub async fn get_table_ddl(params: &ConnectionParams, table_name: &str) -> Resul
     Ok(format!("{};", row.0))
 }
 
+/// `CREATE INDEX` statements of the indexes declared on `table`. Indexes
+/// SQLite creates itself for PRIMARY KEY/UNIQUE constraints have no SQL and
+/// come back with the table definition instead.
+async fn get_index_ddls(params: &ConnectionParams, table: &str) -> Result<Vec<String>, String> {
+    let pool = get_sqlite_pool(params).await?;
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name = ? AND sql IS NOT NULL ORDER BY name",
+    )
+    .bind(table)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().map(|r| r.0).collect())
+}
+
 /// Executes one statement against an already-acquired SQLite connection.
 /// Shared between `execute_query` and `execute_batch` so the latter can
 /// keep a single connection open for transaction (`BEGIN`/`COMMIT`) and
@@ -1064,6 +1082,7 @@ impl SqliteDriver {
                     table_query_templates: false,
                     column_comments: false,
                     drop_table_sql: false,
+                    clone_table: true,
                     alter_column: false,
                     create_foreign_keys: false,
                     no_connection_required: false,
@@ -1539,6 +1558,32 @@ impl DatabaseDriver for SqliteDriver {
         _schema: Option<&str>,
     ) -> Result<String, String> {
         get_table_ddl(params, table).await
+    }
+
+    async fn get_clone_table_sql(
+        &self,
+        params: &crate::models::ConnectionParams,
+        source: &str,
+        target: &str,
+        include_data: bool,
+        _schema: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        crate::drivers::common::validate_clone_table_names(source, target)?;
+        let create_sql = get_table_ddl(params, source).await?;
+        let index_sqls = get_index_ddls(params, source).await?;
+        let data_columns = if include_data {
+            let columns = get_columns(params, source).await?;
+            Some(crate::drivers::common::clone_data_columns(&columns))
+        } else {
+            None
+        };
+        clone_table::clone_table_statements(
+            &create_sql,
+            &index_sqls,
+            source,
+            target,
+            data_columns.as_deref(),
+        )
     }
 
     async fn drop_index(

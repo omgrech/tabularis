@@ -1,4 +1,5 @@
 mod blob;
+mod clone_table;
 mod pooled;
 mod query;
 mod routines;
@@ -10,6 +11,9 @@ mod tests;
 pub use blob::{
     decode_blob_wire_format, encode_blob, encode_blob_full, resolve_blob_file_ref,
     DEFAULT_MAX_BLOB_SIZE, MAX_BLOB_PREVIEW_SIZE,
+};
+pub use clone_table::{
+    clone_data_columns, clone_insert_statement, validate_clone_table_names,
 };
 pub use pooled::DetachOnDrop;
 pub use query::{

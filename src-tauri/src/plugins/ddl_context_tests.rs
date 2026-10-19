@@ -266,3 +266,29 @@ async fn built_in_default_has_no_drop_table_override() {
         .unwrap();
     assert_eq!(sql, None);
 }
+
+#[test]
+fn clone_table_capability_is_opt_in_and_omitted_when_false() {
+    use crate::drivers::driver_trait::DriverCapabilities;
+    let legacy = json!({ "schemas": true, "views": true, "routines": false, "file_based": false });
+    let capabilities: DriverCapabilities = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(!capabilities.clone_table);
+    assert!(serde_json::to_value(&capabilities)
+        .unwrap()
+        .get("clone_table")
+        .is_none());
+    let mut enabled = legacy;
+    enabled["clone_table"] = json!(true);
+    let capabilities: DriverCapabilities = serde_json::from_value(enabled).unwrap();
+    assert!(capabilities.clone_table);
+}
+
+#[tokio::test]
+async fn plugins_do_not_support_clone_table() {
+    let driver = test_driver(|request| panic!("unexpected RPC {}", request.method));
+    let err = driver
+        .get_clone_table_sql(&browsed_params(), "t", "t_copy", true, None)
+        .await
+        .unwrap_err();
+    assert!(err.contains("not supported"), "{err}");
+}

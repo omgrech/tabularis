@@ -2,6 +2,7 @@ pub mod export;
 pub mod extract;
 pub mod types;
 
+mod clone_table;
 mod explain;
 mod helpers;
 mod multi_result;
@@ -10,6 +11,8 @@ mod row_identity;
 mod stmt_classify;
 mod users;
 
+#[cfg(test)]
+mod clone_table_tests;
 #[cfg(test)]
 mod stmt_classify_tests;
 
@@ -1971,6 +1974,7 @@ impl MysqlDriver {
                     table_query_templates: false,
                     column_comments: false,
                     drop_table_sql: false,
+                    clone_table: true,
                     alter_column: true,
                     create_foreign_keys: true,
                     no_connection_required: false,
@@ -2711,6 +2715,28 @@ impl DatabaseDriver for MysqlDriver {
         _schema: Option<&str>,
     ) -> Result<String, String> {
         get_table_ddl(params, table).await
+    }
+
+    async fn get_clone_table_sql(
+        &self,
+        params: &crate::models::ConnectionParams,
+        source: &str,
+        target: &str,
+        include_data: bool,
+        schema: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        crate::drivers::common::validate_clone_table_names(source, target)?;
+        let data_columns = if include_data {
+            let columns = get_columns(params, source, schema).await?;
+            Some(crate::drivers::common::clone_data_columns(&columns))
+        } else {
+            None
+        };
+        Ok(clone_table::clone_table_statements(
+            source,
+            target,
+            data_columns.as_deref(),
+        ))
     }
 
     async fn drop_index(

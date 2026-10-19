@@ -5,11 +5,14 @@ pub mod extract;
 
 mod binding;
 mod client;
+mod clone_table;
 mod explain;
 mod helpers;
 mod routines;
 pub mod session;
 
+#[cfg(test)]
+mod clone_table_tests;
 #[cfg(test)]
 mod tests;
 
@@ -2144,6 +2147,7 @@ impl PostgresDriver {
                     table_query_templates: false,
                     column_comments: false,
                     drop_table_sql: false,
+                    clone_table: true,
                     alter_column: true,
                     create_foreign_keys: true,
                     no_connection_required: false,
@@ -2948,6 +2952,35 @@ impl DatabaseDriver for PostgresDriver {
         schema: Option<&str>,
     ) -> Result<String, String> {
         get_table_ddl(params, table, &self.resolve_schema(schema)).await
+    }
+
+    async fn get_clone_table_sql(
+        &self,
+        params: &crate::models::ConnectionParams,
+        source: &str,
+        target: &str,
+        include_data: bool,
+        schema: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        crate::drivers::common::validate_clone_table_names(source, target)?;
+        let pg_schema = self.resolve_schema(schema);
+        if !include_data {
+            return Ok(clone_table::clone_table_statements(pg_schema, source, target, None, &[]));
+        }
+        let columns = get_columns(params, source, pg_schema).await?;
+        let data_columns = crate::drivers::common::clone_data_columns(&columns);
+        let sequence_columns: Vec<String> = columns
+            .iter()
+            .filter(|c| c.is_auto_increment && !c.is_generated)
+            .map(|c| c.name.clone())
+            .collect();
+        Ok(clone_table::clone_table_statements(
+            pg_schema,
+            source,
+            target,
+            Some(data_columns.as_slice()),
+            &sequence_columns,
+        ))
     }
 
     async fn drop_index(
