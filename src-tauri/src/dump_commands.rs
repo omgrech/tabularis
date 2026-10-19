@@ -722,42 +722,34 @@ pub async fn import_database<R: Runtime>(
                 tx.commit().await.map_err(|e| e.to_string())?;
             }
             "sqlite" => {
+                use sqlx::Connection;
+
                 let pool = get_sqlite_pool(&params).await?;
-                let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+                let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
+                let saved = relax_sqlite_pragmas(&mut conn).await?;
 
-                // Performance optimizations for SQLite
-                sqlx::query("PRAGMA foreign_keys=OFF")
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                sqlx::query("PRAGMA synchronous=OFF")
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                sqlx::query("PRAGMA journal_mode=MEMORY")
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let result = async {
+                    let mut tx = Connection::begin(&mut *conn)
+                        .await
+                        .map_err(|e| e.to_string())?;
 
-                macro_rules! execute_statement {
-                    ($stmt:expr) => {
-                        sqlx::query($stmt).execute(&mut *tx)
-                    };
+                    macro_rules! execute_statement {
+                        ($stmt:expr) => {
+                            sqlx::query($stmt).execute(&mut *tx)
+                        };
+                    }
+
+                    execute_statements_streaming!(execute_statement, stream, app_handle)?;
+
+                    tx.commit().await.map_err(|e| e.to_string())
                 }
+                .await;
 
-                execute_statements_streaming!(execute_statement, stream, app_handle)?;
-
-                // Restore settings
-                sqlx::query("PRAGMA foreign_keys=ON")
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                sqlx::query("PRAGMA synchronous=FULL")
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                tx.commit().await.map_err(|e| e.to_string())?;
+                // The connection goes back to the pool, so its settings are
+                // restored even when the import failed.
+                let restored = restore_sqlite_pragmas(&mut conn, &saved).await;
+                result?;
+                restored?;
             }
             // Any plugin-backed driver: no local pool to open a transaction
             // on (the plugin owns its own pool inside its subprocess), and no
@@ -804,6 +796,55 @@ pub async fn import_database<R: Runtime>(
         Ok(res) => res,
         Err(_) => Err("Import cancelled".into()),
     }
+}
+
+/// The settings an import relaxes on a SQLite connection, as they were.
+#[derive(Debug, PartialEq, Eq)]
+struct SqlitePragmas {
+    synchronous: i64,
+    foreign_keys: i64,
+}
+
+/// Turns off foreign key checks and synchronous writes for an import.
+///
+/// This must run before the import's transaction starts: SQLite rejects a
+/// `synchronous` change inside a transaction ("Safety level may not be
+/// changed inside a transaction") and ignores `foreign_keys` there.
+async fn relax_sqlite_pragmas(conn: &mut sqlx::SqliteConnection) -> Result<SqlitePragmas, String> {
+    let saved = SqlitePragmas {
+        synchronous: sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| e.to_string())?,
+        foreign_keys: sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| e.to_string())?,
+    };
+    for pragma in ["PRAGMA foreign_keys=OFF", "PRAGMA synchronous=OFF"] {
+        sqlx::query(pragma)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(saved)
+}
+
+/// Puts back the settings `relax_sqlite_pragmas` changed.
+async fn restore_sqlite_pragmas(
+    conn: &mut sqlx::SqliteConnection,
+    saved: &SqlitePragmas,
+) -> Result<(), String> {
+    for pragma in [
+        format!("PRAGMA foreign_keys={}", saved.foreign_keys),
+        format!("PRAGMA synchronous={}", saved.synchronous),
+    ] {
+        sqlx::query(&pragma)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 // Creates a BufReader from the file without loading entire content into memory
@@ -954,5 +995,47 @@ mod tests {
     #[test]
     fn test_plugin_dump_has_more_an_empty_page_without_pagination_ends_the_fetch() {
         assert!(!plugin_dump_has_more(None, 0, 1000));
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_import_relaxes_pragmas_outside_the_transaction_and_restores_them() {
+        // Regression: the import set `PRAGMA synchronous` inside its
+        // transaction, which SQLite rejects, so every SQLite import failed.
+        use sqlx::{Connection, SqliteConnection};
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let url = format!("sqlite://{}", db.path().to_str().unwrap());
+        let mut conn = SqliteConnection::connect(&url).await.unwrap();
+        sqlx::query("PRAGMA foreign_keys=ON")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE p (id INTEGER PRIMARY KEY)")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE c (id INTEGER, p_id INTEGER REFERENCES p(id))")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        let saved = relax_sqlite_pragmas(&mut conn).await.unwrap();
+        assert_eq!(saved.foreign_keys, 1);
+        {
+            let mut tx = Connection::begin(&mut conn).await.unwrap();
+            // A child row before its parent: accepted with foreign keys off.
+            sqlx::query("INSERT INTO c VALUES (1, 7)")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO p VALUES (7)")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+        restore_sqlite_pragmas(&mut conn, &saved).await.unwrap();
+
+        let after = relax_sqlite_pragmas(&mut conn).await.unwrap();
+        assert_eq!(after, saved, "settings are back to what they were");
     }
 }
